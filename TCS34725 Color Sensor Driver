@@ -1,0 +1,100 @@
+# Driver for the TCS34725 color sensor.
+import time
+from adafruit_bus_device.i2c_device import I2CDevice
+
+# Register definitions
+_TCS34725_ADDRESS = 0x29
+_TCS34725_COMMAND_BIT = 0x80
+_TCS34725_ENABLE = 0x00
+_TCS34725_ENABLE_AEN = 0x02
+_TCS34725_ENABLE_PON = 0x01
+_TCS34725_ATIME = 0x01
+_TCS34725_CONTROL = 0x0F
+_TCS34725_ID = 0x12
+_TCS34725_CDATAL = 0x14
+_TCS34725_RDATAL = 0x16
+_TCS34725_GDATAL = 0x18
+_TCS34725_BDATAL = 0x1A
+
+class TCS34725:
+    """Driver for the TCS34725 color sensor."""
+
+    def __init__(self, i2c):
+        self._device = I2CDevice(i2c, _TCS34725_ADDRESS)
+
+        # Verify sensor ID
+        if self._read_u8(_TCS34725_ID) not in (0x44, 0x10):
+            raise RuntimeError("TCS34725 not found at address 0x29")
+
+        # Set integration time (0xEB = 100 ms) and gain (0x01 = 4x)
+        self._write_u8(_TCS34725_ATIME, 0xEB)
+        self._write_u8(_TCS34725_CONTROL, 0x01)
+        self.active = True
+        time.sleep(0.7) # Wait for sensor to power up/stabilize
+
+    # --- I2C helpers ---
+    def _read_u8(self, address):
+        # Reads an 8-bit value from a register address
+        with self._device as i2c:
+            i2c.write(bytes([_TCS34725_COMMAND_BIT | address]))
+            result = bytearray(1)
+            i2c.readinto(result)
+            return result[0]
+
+    def _read_u16(self, address):
+        # Reads a 16-bit value (LSB then MSB) from two consecutive register addresses
+        with self._device as i2c:
+            i2c.write(bytes([_TCS34725_COMMAND_BIT | address]))
+            result = bytearray(2)
+            i2c.readinto(result)
+            return result[1] << 8 | result[0]
+
+    def _write_u8(self, address, val):
+        # Writes an 8-bit value to a register address
+        with self._device as i2c:
+            i2c.write(bytes([_TCS34725_COMMAND_BIT | address, val & 0xFF]))
+
+    # --- Main control (Active/Sleep) ---
+    @property
+    def active(self):
+        """Return True if sensor is active (ADC and Power On)."""
+        enable = self._read_u8(_TCS34725_ENABLE)
+        return bool(enable & _TCS34725_ENABLE_AEN)
+
+    @active.setter
+    def active(self, val):
+        # Enable or disable the sensor
+        enable = self._read_u8(_TCS34725_ENABLE)
+        if val:
+            enable |= (_TCS34725_ENABLE_PON | _TCS34725_ENABLE_AEN)
+            self._write_u8(_TCS34725_ENABLE, enable)
+            time.sleep(0.003)
+        else:
+            enable &= ~(_TCS34725_ENABLE_PON | _TCS34725_ENABLE_AEN)
+            self._write_u8(_TCS34725_ENABLE, enable)
+
+    # --- Read color data ---
+    @property
+    def color_raw(self):
+        """Return raw (r, g, b, c) tuple from sensor registers."""
+        r = self._read_u16(_TCS34725_RDATAL)
+        g = self._read_u16(_TCS34725_GDATAL)
+        b = self._read_u16(_TCS34725_BDATAL)
+        c = self._read_u16(_TCS34725_CDATAL)
+        return (r, g, b, c)
+
+    def color_temperature(self):
+        """Return color temperature in Kelvin (algorithm adapted from Adafruit)."""
+        r, g, b, _ = self.color_raw
+        if r == 0 or g == 0 or b == 0:
+            return 0
+        
+        # Simplified color temperature calculation (may need calibration)
+        X = (-0.14282 * r) + (1.54924 * g) + (-0.95641 * b)
+        Y = (-0.32466 * r) + (1.57837 * g) + (-0.73191 * b)
+        Z = (-0.68202 * r) + (0.77073 * g) + (0.56332 * b)
+        xc = X / (X + Y + Z)
+        yc = Y / (X + Y + Z)
+        n = (xc - 0.3320) / (0.1858 - yc)
+        cct = 449.0 * (n**3) + 3525.0 * (n**2) + 6823.3 * n + 5520.33
+        return int(cct)
