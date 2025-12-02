@@ -1,0 +1,41 @@
+from micropython import const
+import time
+
+class I2CDevice:
+    """
+    I2CDevice class to handle I2C transactions including an optional lock.
+    Adapted for MicroPython compatibility.
+    """
+    def __init__(self, i2c, device_address):
+        self.i2c = i2c
+        self.device_address = device_address
+        self._lock = False
+
+    def __enter__(self):
+        # Context manager start: acquire lock before transaction
+        self._acquire_lock()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Context manager end: release lock
+        self._release_lock()
+
+    def _acquire_lock(self):
+        # Wait until we can safely access the I2C bus
+        while self._lock:
+            time.sleep_ms(1)
+        self._lock = True
+
+    def _release_lock(self):
+        self._lock = False
+
+    def write(self, buf, *, start=0, end=None):
+        # Write buffer to I2C device
+        end = end if end is not None else len(buf)
+        self.i2c.writeto(self.device_address, memoryview(buf)[start:end])
+
+    def readinto(self, buf, *, start=0, end=None):
+        # Read from I2C device into buffer
+        end = end if end is not None else len(buf)
+        read_buf = memoryview(buf)[start:end]
+        self.i2c.readfrom_into(self.device_address, read_buf)
