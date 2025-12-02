@@ -1,0 +1,193 @@
+# OTV Mission Control: Combines IR, Ultrasonic, and Color Sensing in sequence.
+# This script runs the IR check, then Ultrasonic depth, then Color analysis repeatedly.
+
+from hcsr04 import HCSR04
+from machine import Pin, I2C
+from adafruit_tcs34725 import TCS34725
+from time import sleep
+# Assuming 'enes100' is a library available in your MicroPython environment
+from enes100 import enes100 
+import sys # For clean error handling
+
+# ---------------------------
+# GLOBAL CONSTANTS & PINS
+# ---------------------------
+# Ultrasonic Sensor (HC-SR04) Pins - Wiring: TRIG -> 5, ECHO -> 18
+TRIG_PIN = 5
+ECHO_PIN = 18
+CONTAINER_HEIGHT_MM = 71
+CALIBRATION_OFFSET_MM = -30
+
+# Color Sensor (TCS34725) I2C Pins - Wiring: SDA -> 21, SCL -> 22
+SCL_PIN = 22 # Clock
+SDA_PIN = 21 # Data
+LED_PIN = 4  # External LED for illumination (if used)
+
+# IR Sensor (Obstacle Detection) Pin - Wiring: Signal -> 23
+IR_SENSOR_PIN = 23 # Digital Input
+
+# ---------------------------
+# INITIALIZATION
+# ---------------------------
+
+# Initialize ENES100 system
+try:
+    enes100.begin('Water breathing rubber duckies', 'Water', 635, 1120)
+    print("ENES100 system initialized.")
+except Exception as e:
+    print(f"Warning: Could not initialize ENES100. Is the library installed? Error: {e}")
+
+# 1. Ultrasonic Sensor Setup
+try:
+    sensor_ultra = HCSR04(trigger_pin=TRIG_PIN, echo_pin=ECHO_PIN, echo_timeout_us=10000)
+    print("Ultrasonic sensor ready.")
+except Exception as e:
+    print(f"Error initializing Ultrasonic Sensor: {e}")
+    # If the core sensor fails, it might be best to stop execution
+    # sys.exit() 
+
+# 2. Color Sensor Setup
+try:
+    i2c = I2C(0, scl=Pin(SCL_PIN), sda=Pin(SDA_PIN))
+    sensor_color = TCS34725(i2c)
+    sensor_color.active = True
+    led_pin = Pin(LED_PIN, Pin.OUT)
+    led_pin.value(1) # Turn LED ON for color sensing
+    print("Color sensor ready (I2C device ID: 0x29).")
+except Exception as e:
+    print(f"Error initializing Color Sensor: {e}")
+    # If this fails, the main loop will catch errors during color analysis
+    sensor_color = None # Set to None to indicate failure
+
+# 3. IR Sensor Setup
+try:
+    # Sensor state 0 = Obstacle detected (typical for active-low)
+    ir_sensor = Pin(IR_SENSOR_PIN, Pin.IN)
+    print("IR sensor ready.")
+except Exception as e:
+    print(f"Error initializing IR Sensor: {e}")
+    # sys.exit()
+    ir_sensor = None # Set to None to indicate failure
+
+print("----------------------------------------")
+
+# ---------------------------
+# HELPER FUNCTIONS
+# ---------------------------
+
+def detect_color(r, g, b):
+    """Basic color detection logic based on provided thresholds."""
+    total = r + g + b
+    if total == 0:
+        return "NO_BLOCK"
+
+    r_norm = r / total
+    g_norm = g / total
+    b_norm = b / total
+
+    # Define color detection logic
+    if r_norm > 0.40 and r_norm > g_norm and r_norm > b_norm:
+        return "RED"
+    elif g_norm > 0.40 and g_norm > r_norm and g_norm > b_norm:
+        return "GREEN"
+    elif b_norm > 0.40 and b_norm > r_norm and b_norm > g_norm:
+        return "BLUE"
+    elif r_norm > 0.35 and g_norm > 0.35 and b_norm < 0.25:
+        return "YELLOW"
+    else:
+        # Assumed to be clear water or a non-target color block
+        return "CLEAR"
+
+def check_ir_obstacle():
+    """Reads the IR sensor and sends a navigation command if an obstacle is found."""
+    if ir_sensor is None:
+        print("IR Status: Sensor not initialized.")
+        return False
+        
+    # Assuming active-low: 0 means obstacle detected
+    obstacle_detected = ir_sensor.value() == 0
+    
+    if obstacle_detected:
+        print("IR Status: OBSTACLE DETECTED. Stopping movement.")
+        # Send a mission command for navigation/obstacle status
+        enes100.mission('NAV_STATUS', 'OBSTACLE_AHEAD')
+    else:
+        print("IR Status: Path is clear.")
+        # 'CLEAR' means safe to proceed
+        enes100.mission('NAV_STATUS', 'CLEAR')
+        
+    return obstacle_detected
+
+def measure_depth():
+    """Reads the ultrasonic sensor for water depth and reports to ENES100."""
+    try:
+        # distanceMm() is used from the hcsr04.py file
+        distanceToSurface = sensor_ultra.distanceMm() + CALIBRATION_OFFSET_MM
+        waterDepth = CONTAINER_HEIGHT_MM - distanceToSurface
+        
+        # Ensure depth is not negative
+        if waterDepth < 0:
+            waterDepth = 0
+
+        print("Distance to surface: {:.1f} mm".format(distanceToSurface))
+        print("Water depth: {:.1f} mm".format(waterDepth))
+
+        # Report to the mission control
+        enes100.mission('DEPTH', int(waterDepth))
+        
+    except OSError as e:
+        print("Ultrasonic error (Out of range or IO):", e)
+    except Exception as e:
+        print("Unexpected error in depth measurement:", e)
+
+def analyze_color():
+    """Reads the color sensor, detects water type, and reports to ENES100."""
+    if sensor_color is None:
+        print("Color Status: Sensor not initialized.")
+        return
+
+    try:
+        r, g, b, c = sensor_color.color_raw
+        color = detect_color(r, g, b)
+
+        print("Raw Color: R={} G={} B={} C={}".format(r, g, b, c))
+        print("Detected color:", color)
+
+        # Report water type based on color detection
+        if color in ["RED", "GREEN", "BLUE", "YELLOW"]:
+            # Detected color block means polluted/contaminated water
+            enes100.mission('WATER_TYPE', 'FRESH_POLLUTED')
+        else:
+            # Clear water/no block detected
+            enes100.mission('WATER_TYPE', 'FRESH_UNPOLLUTED')
+
+    except Exception as e:
+        print("Color sensor error:", e)
+
+# ---------------------------
+# MAIN LOOP: Sequential Execution
+# ---------------------------
+
+while True:
+    print("\n================= OTV MISSION CYCLE START =================")
+
+    # 1. OBSTACLE CHECK (IR Sensor)
+    # Check for immediate danger/obstacle before moving or sensing
+    obstacle_found = check_ir_obstacle()
+    
+    # If an obstacle is found, pause for longer and skip water/color sensing 
+    if obstacle_found:
+        sleep(2)
+        continue # Start the loop over to immediately re-check for the obstacle
+
+    # 2. DEPTH MEASUREMENT (Ultrasonic Sensor)
+    measure_depth()
+    sleep(1) # Short delay between sensing tasks
+
+    # 3. WATER TYPE ANALYSIS (Color Sensor)
+    analyze_color()
+
+    print("================= OTV MISSION CYCLE END ===================")
+    
+    # Wait before starting the next full cycle
+    sleep(1.5)
